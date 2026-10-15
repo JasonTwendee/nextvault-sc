@@ -174,6 +174,7 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
     error DepositDebtLimitExceeded();
     error DepositCannotBeReduced();
     error ConsignorCannotParticipate();
+    error WinnerNftNotRefundable();
 
     event AuctionCreated(bytes32 indexed lotId, address indexed nftCollection, uint256 blockTimestamp);
     event AuctionDetailsUpdated(
@@ -880,6 +881,7 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
 
     function settleAuctionPayment(bytes32 lotId) external returns (bool paymentCollected) {
         if (!auctionExists[lotId]) revert AuctionNotFound();
+        if (cancelledAuctions[lotId]) revert AuctionIsCancelled();
         if (!endedAuctions[lotId]) revert AuctionNotEnded();
         if (auctionPaymentCollected[lotId]) revert AuctionPaymentAlreadyCollected();
 
@@ -945,17 +947,14 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
         if (!auctionExists[lotId]) revert AuctionNotFound();
         if (cancelledAuctions[lotId]) revert AuctionAlreadyCancelled();
 
-        AuctionConfig memory auction = auctions[lotId];
-        AuctionStatus status = _currentStatus(auction.startTime, auction.previewDurationSeconds, auction.endTime);
-        if (endedAuctions[lotId] || (status != AuctionStatus.Preview && status != AuctionStatus.Active)) {
-            revert AuctionNotActive();
-        }
-
         cancelledAuctions[lotId] = true;
+        auctionPaymentDeadline[lotId] = 0;
 
         emit AuctionWithdrawn(lotId, itemToCurrentBidder[lotId], block.timestamp);
 
-        if (itemToCurrentBidder[lotId] != address(0)) {
+        // Settled deposits have already paid the consignor/platform. They must
+        // never be refunded a second time when withdrawing a finalized lot.
+        if (!auctionPaymentCollected[lotId] && itemToCurrentBidder[lotId] != address(0)) {
             _refundBid(lotId);
         }
         itemToCurrentBid[lotId] = 0;
@@ -972,6 +971,11 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
 
         AuctionConfig storage auction = auctions[lotId];
         LotNFT nftCollection = LotNFT(auction.nftCollection);
+        // Passes occupy IDs 1..maxSupply. The complimentary winner NFT is
+        // maxSupply + 1 and stays with its holder, including after transfer.
+        for (uint256 i; i < quantity; ++i) {
+            if (tokenIds[i] > auction.nftMaxSupply) revert WinnerNftNotRefundable();
+        }
         nftCollection.burnBatchForRefund(msg.sender, tokenIds);
 
         uint256 refundAmount = auction.nftPrice * quantity;
@@ -988,7 +992,13 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
         if (!auctionExists[lotId]) revert AuctionNotFound();
 
         AuctionConfig storage auction = auctions[lotId];
-        quantity = LotNFT(auction.nftCollection).balanceOf(holder);
+        LotNFT collection = LotNFT(auction.nftCollection);
+        quantity = collection.balanceOf(holder);
+        try collection.ownerOf(auction.nftMaxSupply + 1) returns (address winnerNftHolder) {
+            if (winnerNftHolder == holder) quantity--;
+        } catch {
+            // The winner NFT has not been minted yet.
+        }
         if (cancelledAuctions[lotId]) refundAmount = quantity * auction.nftPrice;
     }
 

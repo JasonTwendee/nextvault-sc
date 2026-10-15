@@ -1253,13 +1253,176 @@ contract AuctionEndWithdrawTest is Test {
         assertEq(uint256(auction.currentStatus(LOT_ID)), uint256(Auction.AuctionStatus.Cancelled));
     }
 
-    function testWithdrawRevertsAtOrAfterEndTimestamp() external {
+    function testWithdrawAtEndTimestampBeforeEndWorkerRuns() external {
         Auction.AuctionConfig memory config = _createAuction(0);
+        _buyNftAndPlaceManualBid(bidderA, STARTING_BID);
         vm.warp(config.endTime);
 
         vm.prank(operator);
-        vm.expectRevert(Auction.AuctionNotActive.selector);
         auction.withdrawAuction(LOT_ID);
+        assertEq(token.balanceOf(bidderA), STARTING_BALANCE - NFT_PRICE);
+        vm.prank(operator);
+        vm.expectRevert(Auction.AuctionIsCancelled.selector);
+        auction.endAuction(LOT_ID);
+    }
+
+    function testWithdrawDuringGraceWaivesPaymentAndPreventsDefault() external {
+        Auction.AuctionConfig memory config = _createAuction(0);
+        _buyNftAndPlaceManualBid(bidderA, STARTING_BID);
+        vm.warp(config.endTime);
+        vm.prank(operator);
+        auction.endAuction(LOT_ID);
+        assertGt(auction.auctionPaymentDeadline(LOT_ID), 0);
+
+        vm.prank(operator);
+        auction.withdrawAuction(LOT_ID);
+        assertEq(auction.auctionPaymentDeadline(LOT_ID), 0);
+        assertEq(token.balanceOf(bidderA), STARTING_BALANCE - NFT_PRICE);
+
+        _approveRemainingPayment(bidderA, STARTING_BID);
+        vm.warp(config.endTime + config.paymentGracePeriodSeconds + 1);
+        vm.prank(operator);
+        vm.expectRevert(Auction.AuctionIsCancelled.selector);
+        auction.settleAuctionPayment(LOT_ID);
+        vm.prank(bidderA);
+        vm.expectRevert(Auction.AuctionIsCancelled.selector);
+        auction.settleAuctionPayment(LOT_ID);
+        assertFalse(auction.blacklistedWallets(bidderA));
+        assertEq(auction.auctionBidRound(LOT_ID), 0);
+        assertEq(token.balanceOf(bidderA), STARTING_BALANCE - NFT_PRICE);
+
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = 1;
+        vm.prank(bidderA);
+        auction.claimNFTRefund(LOT_ID, ids);
+        assertEq(token.balanceOf(bidderA), STARTING_BALANCE);
+    }
+
+    function testWithdrawDuringGraceAllowsAutoBidDepositRefund() external {
+        Auction.AuctionConfig memory config = _createAuction(0);
+        _buyNft(bidderA);
+        _setMaxBidAndPlaceFor(bidderA, 15_000 * USDC, STARTING_BID);
+        vm.warp(config.endTime);
+        vm.startPrank(operator);
+        auction.endAuction(LOT_ID);
+        auction.withdrawAuction(LOT_ID);
+        auction.refundMaxBid(LOT_ID, bidderA);
+        vm.stopPrank();
+        assertEq(token.balanceOf(bidderA), STARTING_BALANCE - NFT_PRICE);
+        assertEq(auction.auctionPaymentDeadline(LOT_ID), 0);
+        assertFalse(auction.blacklistedWallets(bidderA));
+    }
+
+    function testWithdrawBoughtInRefundsPasses() external {
+        Auction.AuctionConfig memory config = _createAuction(0);
+        _buyNft(bidderA);
+        vm.warp(config.endTime);
+        vm.startPrank(operator);
+        auction.endAuction(LOT_ID);
+        auction.withdrawAuction(LOT_ID);
+        vm.stopPrank();
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = 1;
+        vm.prank(bidderA);
+        auction.claimNFTRefund(LOT_ID, ids);
+        assertEq(token.balanceOf(bidderA), STARTING_BALANCE);
+    }
+
+    function testWithdrawFinalizedPreservesSettlementAndWinnerNft() external {
+        Auction.AuctionConfig memory config = _createAuction(0);
+        _buyNftAndPlaceManualBid(bidderA, STARTING_BID);
+        _approveRemainingPayment(bidderA, STARTING_BID);
+        vm.warp(config.endTime);
+        vm.prank(operator);
+        auction.endAuction(LOT_ID);
+        assertTrue(auction.auctionPaymentCollected(LOT_ID));
+        uint256 buyerBalance = token.balanceOf(bidderA);
+        uint256 consignorBalance = token.balanceOf(consignor);
+        uint256 treasuryBalance = token.balanceOf(admin);
+
+        vm.prank(operator);
+        auction.withdrawAuction(LOT_ID);
+        assertEq(uint256(auction.currentStatus(LOT_ID)), uint256(Auction.AuctionStatus.Cancelled));
+        assertTrue(auction.auctionPaymentCollected(LOT_ID));
+        assertEq(token.balanceOf(bidderA), buyerBalance);
+        assertEq(token.balanceOf(consignor), consignorBalance);
+        assertEq(token.balanceOf(admin), treasuryBalance);
+
+        LotNFT collection = LotNFT(config.nftCollection);
+        uint256 winnerId = config.nftMaxSupply + 1;
+        assertEq(collection.ownerOf(winnerId), bidderA);
+        (uint256 count, uint256 amount) = auction.getNFTRefundAmount(LOT_ID, bidderA);
+        assertEq(count, 1);
+        assertEq(amount, NFT_PRICE);
+
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = 1;
+        ids[1] = winnerId;
+        vm.prank(bidderA);
+        vm.expectRevert(Auction.WinnerNftNotRefundable.selector);
+        auction.claimNFTRefund(LOT_ID, ids);
+        assertEq(collection.ownerOf(1), bidderA);
+
+        ids = new uint256[](1);
+        ids[0] = 1;
+        vm.prank(bidderA);
+        auction.claimNFTRefund(LOT_ID, ids);
+        assertEq(token.balanceOf(bidderA), buyerBalance + NFT_PRICE);
+        assertEq(collection.ownerOf(winnerId), bidderA);
+
+        vm.prank(bidderA);
+        collection.transferFrom(bidderA, bidderB, winnerId);
+        (count, amount) = auction.getNFTRefundAmount(LOT_ID, bidderB);
+        assertEq(count, 0);
+        assertEq(amount, 0);
+        ids[0] = winnerId;
+        vm.prank(bidderB);
+        vm.expectRevert(Auction.WinnerNftNotRefundable.selector);
+        auction.claimNFTRefund(LOT_ID, ids);
+    }
+
+    function testPassRefundCanRetryAfterContractIsFunded() external {
+        Auction.AuctionConfig memory config = _createAuction(0);
+        _buyNft(bidderA);
+        vm.warp(config.endTime);
+        vm.prank(operator);
+        auction.endAuction(LOT_ID);
+        vm.prank(operator);
+        auction.withdrawAuction(LOT_ID);
+
+        // Simulate a missing refund reserve, then a USDC top-up. A failed
+        // refund must roll back the burn so the holder can retry safely.
+        vm.prank(address(auction));
+        token.transfer(admin, NFT_PRICE);
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = 1;
+        vm.prank(bidderA);
+        vm.expectRevert();
+        auction.claimNFTRefund(LOT_ID, ids);
+        assertEq(LotNFT(config.nftCollection).ownerOf(1), bidderA);
+        vm.prank(admin);
+        token.transfer(address(auction), NFT_PRICE);
+        vm.prank(bidderA);
+        auction.claimNFTRefund(LOT_ID, ids);
+        assertEq(token.balanceOf(bidderA), STARTING_BALANCE);
+    }
+
+    function testWithdrawFinalizedAutoBidDoesNotRefundSettledDeposit() external {
+        Auction.AuctionConfig memory config = _createAuction(0);
+        _buyNft(bidderA);
+        _setMaxBidAndPlaceFor(bidderA, 15_000 * USDC, STARTING_BID);
+        _approveRemainingPayment(bidderA, STARTING_BID);
+        vm.warp(config.endTime);
+        vm.prank(operator);
+        auction.endAuction(LOT_ID);
+        assertTrue(auction.auctionPaymentCollected(LOT_ID));
+        uint256 balanceBefore = token.balanceOf(bidderA);
+        vm.startPrank(operator);
+        auction.withdrawAuction(LOT_ID);
+        vm.expectRevert(Auction.InvalidAmount.selector);
+        auction.refundMaxBid(LOT_ID, bidderA);
+        vm.stopPrank();
+        assertEq(token.balanceOf(bidderA), balanceBefore);
     }
 
     function testWithdrawRevertsWhenCalledTwice() external {
