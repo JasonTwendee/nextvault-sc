@@ -33,7 +33,7 @@ contract RevenueCallbackUSDC is FakeUSDC {
     }
 }
 
-contract AuctionRevenueTest is Test {
+abstract contract AuctionRevenueFixture is Test {
     Auction auction;
     FakeUSDC token;
     NFTDesignManager manager;
@@ -49,7 +49,7 @@ contract AuctionRevenueTest is Test {
     address treasury = makeAddr("treasury");
     uint256 nonceCounter;
 
-    function setUp() public {
+    function setUp() public virtual {
         admin = vm.addr(ADMIN_KEY);
         signer = vm.addr(SIGNER_KEY);
         token = new FakeUSDC();
@@ -226,7 +226,9 @@ contract AuctionRevenueTest is Test {
         auction.setSettlementConfig(a, _sign(hash, ADMIN_KEY, address(auction), block.chainid));
         treasury = value;
     }
+}
 
+contract AuctionRevenueTest is AuctionRevenueFixture {
     function testCustomerElevenStepExample() public {
         bytes32 a = _create(1, 100, 0);
         bytes32 b = _create(2, 100, 0);

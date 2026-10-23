@@ -9,4 +9,13 @@ via_ir = true
 bytecode_hash = "none"
 cbor_metadata = false
 
+# Reproducible stronger financial/security regression runs; default unchanged.
+[profile.security.fuzz]
+runs = 2048
+
+[profile.security.invariant]
+runs = 512
+depth = 128
+fail_on_revert = true
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
