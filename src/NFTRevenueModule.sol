@@ -36,8 +36,8 @@ interface IRevenueAuction {
     function consumeRevenueNonce(bytes32 nonce) external;
 }
 
-/// @dev Immutable code module executed through Auction delegatecall. Entry role
-/// and reentrancy checks are enforced by Auction; funds/storage stay in its proxy.
+/// @dev Delegatecall module: backend authorizations attest BE Admin membership.
+/// The proxy enforces reentrancy checks; callers need no SC governance role.
 contract NFTRevenueModule {
     using SafeERC20 for IERC20;
     AuctionSignatureVerifier private immutable VERIFIER;
@@ -47,6 +47,13 @@ contract NFTRevenueModule {
         address admin;
         uint256 amount;
         address treasury;
+        bytes32 nonce;
+        uint256 deadline;
+    }
+
+    struct NFTRevenueDeposit {
+        address admin;
+        uint256 amount;
         bytes32 nonce;
         uint256 deadline;
     }
@@ -76,7 +83,23 @@ contract NFTRevenueModule {
         _;
     }
 
-    function depositNFTRevenue(uint256 amount) external delegatedOnly {
+    function depositNFTRevenue(NFTRevenueDeposit calldata a, bytes calldata signature) external delegatedOnly {
+        if (a.admin != msg.sender) revert InvalidRevenueAuthorization();
+        _authorize(
+            keccak256(
+                abi.encode(
+                    keccak256("NFTRevenueDeposit(address admin,uint256 amount,bytes32 nonce,uint256 deadline)"),
+                    a.admin,
+                    a.amount,
+                    a.nonce,
+                    a.deadline
+                )
+            ),
+            a.nonce,
+            a.deadline,
+            signature
+        );
+        uint256 amount = a.amount;
         if (amount == 0) revert InvalidAmount();
         IERC20 token = IRevenueAuction(address(this)).token();
         uint256 beforeBalance = token.balanceOf(address(this));
@@ -103,8 +126,6 @@ contract NFTRevenueModule {
     function withdrawNFTRevenue(NFTRevenueWithdrawal calldata a, bytes calldata signature) external delegatedOnly {
         IRevenueAuction self = IRevenueAuction(address(this));
         if (a.admin != msg.sender || a.treasury != self.treasury()) revert InvalidRevenueAuthorization();
-        if (a.deadline < block.timestamp) revert AuthorizationExpired();
-        if (self.usedNonces(a.nonce)) revert NonceAlreadyUsed();
         bytes32 hash = keccak256(
             abi.encode(
                 keccak256(
@@ -117,15 +138,22 @@ contract NFTRevenueModule {
                 a.deadline
             )
         );
-        address signer = VERIFIER.recoverSigner(hash, address(this), signature);
-        if (!self.hasRole(keccak256("REVENUE_AUTHORIZER_ROLE"), signer)) revert InvalidSigner();
+        _authorize(hash, a.nonce, a.deadline, signature);
         if (a.amount == 0) revert InvalidAmount();
         NFTRevenueStorage.Layout storage s = NFTRevenueStorage.layout();
         uint256 available = s.eligiblePassRevenue + s.totalDeposited - s.totalWithdrawn;
         if (a.amount > available) revert InsufficientNFTRevenue(a.amount, available);
-        self.consumeRevenueNonce(a.nonce);
         s.totalWithdrawn += a.amount;
         self.token().safeTransfer(a.treasury, a.amount);
         emit NFTRevenueWithdrawn(msg.sender, a.treasury, a.amount, a.nonce, block.timestamp);
+    }
+
+    function _authorize(bytes32 hash, bytes32 nonce, uint256 deadline, bytes calldata signature) private {
+        IRevenueAuction self = IRevenueAuction(address(this));
+        if (deadline < block.timestamp) revert AuthorizationExpired();
+        if (self.usedNonces(nonce)) revert NonceAlreadyUsed();
+        address signer = VERIFIER.recoverSigner(hash, address(this), signature);
+        if (!self.hasRole(keccak256("REVENUE_AUTHORIZER_ROLE"), signer)) revert InvalidSigner();
+        self.consumeRevenueNonce(nonce);
     }
 }

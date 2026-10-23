@@ -2,7 +2,7 @@
 pragma solidity ^0.8.13;
 
 import {Test} from "forge-std/Test.sol";
-import {AuctionRevenueFixture} from "./AuctionRevenue.t.sol";
+import {AuctionRevenueFixture, signedRevenueDeposit} from "./AuctionRevenue.t.sol";
 import {Auction} from "../src/Auction.sol";
 import {FakeUSDC} from "../src/FakeUSDC.sol";
 import {LotNFT} from "../src/LotNFT.sol";
@@ -50,7 +50,7 @@ contract AuctionRevenueSecurityTest is AuctionRevenueFixture {
         assertEq(token.balanceOf(treasury), U);
     }
 
-    function testRevokedAdminCannotExecuteAnOutstandingSignature() public {
+    function testScAdminRoleIsNotRequiredForBackendAuthorizedCaller() public {
         _deposit(U);
         Auction.NFTRevenueWithdrawal memory a = _authorization(U);
         bytes memory sig = _signature(a, SIGNER_KEY, address(auction), block.chainid);
@@ -59,11 +59,10 @@ contract AuctionRevenueSecurityTest is AuctionRevenueFixture {
         auction.grantRole(role, buyer);
         vm.prank(buyer);
         auction.revokeRole(role, admin);
-        vm.expectRevert();
         vm.prank(admin);
         auction.withdrawNFTRevenue(a, sig);
-        assertFalse(auction.usedNonces(a.nonce));
-        assertEq(auction.getMaxWithdraw(), U);
+        assertTrue(auction.usedNonces(a.nonce));
+        assertEq(auction.getMaxWithdraw(), 0);
     }
 
     function testMalformedAndMalleableSignaturesNeverConsumeNonceOrMoney() public {
@@ -196,8 +195,8 @@ contract AuctionRevenueSecurityTest is AuctionRevenueFixture {
         malicious.mint(admin, 10 * U);
         vm.startPrank(admin);
         malicious.approve(address(target), 10 * U);
-        target.depositNFTRevenue(10 * U);
         vm.stopPrank();
+        _depositTo(target, 10 * U);
         // Target treasury starts as admin. Callback token is also an Admin so
         // only the lock, not role/auth rejection, can stop this valid inner call.
         Auction.NFTRevenueWithdrawal memory inner =
@@ -309,8 +308,10 @@ contract RevenueInvariantHandler is Test {
 
     function deposit(uint96 raw) external {
         uint256 amount = bound(uint256(raw), 1, 1000e6);
+        (Auction.NFTRevenueDeposit memory a, bytes memory sig) =
+            signedRevenueDeposit(auction, admin, amount, keccak256(abi.encode("invariant-deposit", ++nonce)));
         vm.prank(admin);
-        auction.depositNFTRevenue(amount);
+        auction.depositNFTRevenue(a, sig);
         deposits += amount;
     }
 

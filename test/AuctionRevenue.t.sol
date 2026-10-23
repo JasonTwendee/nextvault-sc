@@ -11,6 +11,36 @@ import {NFTDesignManager} from "../src/NFTDesignManager.sol";
 import {MockVRFCoordinator} from "./mocks/MockVRFCoordinator.sol";
 import {NFTRevenueModule} from "../src/NFTRevenueModule.sol";
 
+function signedRevenueDeposit(Auction target, address caller, uint256 amount, bytes32 nonce)
+    view
+    returns (Auction.NFTRevenueDeposit memory a, bytes memory signature)
+{
+    a = Auction.NFTRevenueDeposit(
+        caller, amount, nonce, Vm(address(uint160(uint256(keccak256("hevm cheat code"))))).getBlockTimestamp() + 1 hours
+    );
+    bytes32 hash = keccak256(
+        abi.encode(
+            keccak256("NFTRevenueDeposit(address admin,uint256 amount,bytes32 nonce,uint256 deadline)"),
+            a.admin,
+            a.amount,
+            a.nonce,
+            a.deadline
+        )
+    );
+    bytes32 domain = keccak256(
+        abi.encode(
+            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+            keccak256("NextVaultAuction"),
+            keccak256("1"),
+            block.chainid,
+            address(target)
+        )
+    );
+    (uint8 v, bytes32 r, bytes32 ss) = Vm(address(uint160(uint256(keccak256("hevm cheat code")))))
+        .sign(0xBEEF, keccak256(abi.encodePacked("\x19\x01", domain, hash)));
+    signature = abi.encodePacked(r, ss, v);
+}
+
 contract RevenueCallbackUSDC is FakeUSDC {
     address public callbackTarget;
     bool public callbackSucceeded;
@@ -25,7 +55,12 @@ contract RevenueCallbackUSDC is FakeUSDC {
         address target = callbackTarget;
         callbackTarget = address(0);
         if (target != address(0)) {
-            (callbackSucceeded,) = target.call(abi.encodeCall(Auction.depositNFTRevenue, (1)));
+            (callbackSucceeded,) = target.call(
+                abi.encodeCall(
+                    Auction.depositNFTRevenue,
+                    (Auction.NFTRevenueDeposit(address(this), 1, bytes32(0), type(uint256).max), bytes(""))
+                )
+            );
         }
         bool success = super.transferFrom(from, to, amount);
         if (takeFee) _burn(to, 1);
@@ -166,8 +201,14 @@ abstract contract AuctionRevenueFixture is Test {
     }
 
     function _deposit(uint256 amount) internal {
+        _depositTo(auction, amount);
+    }
+
+    function _depositTo(Auction target, uint256 amount) internal {
+        (Auction.NFTRevenueDeposit memory a, bytes memory sig) =
+            signedRevenueDeposit(target, admin, amount, keccak256(abi.encode("deposit", ++nonceCounter)));
         vm.prank(admin);
-        auction.depositNFTRevenue(amount);
+        target.depositNFTRevenue(a, sig);
     }
 
     function _authorization(uint256 amount) internal returns (Auction.NFTRevenueWithdrawal memory a) {
@@ -394,7 +435,7 @@ contract AuctionRevenueTest is AuctionRevenueFixture {
         assertEq(auction.getMaxWithdraw(), 10 * U);
     }
 
-    function testOnlyAdminCanDepositOrWithdrawEvenWithAuthorization() public {
+    function testOtherWalletsCannotUseAuthorizationBoundToAdmin() public {
         _deposit(10 * U);
         Auction.NFTRevenueWithdrawal memory a = _authorization(U);
         bytes memory signature = _signature(a, SIGNER_KEY, address(auction), block.chainid);
@@ -402,7 +443,7 @@ contract AuctionRevenueTest is AuctionRevenueFixture {
             address caller = i == 0 ? buyer : i == 1 ? operator : signer;
             vm.expectRevert();
             vm.prank(caller);
-            auction.depositNFTRevenue(U);
+            auction.depositNFTRevenue(Auction.NFTRevenueDeposit(admin, U, bytes32(0), block.timestamp + 1), "");
             vm.expectRevert();
             vm.prank(caller);
             auction.withdrawNFTRevenue(a, signature);
@@ -482,8 +523,7 @@ contract AuctionRevenueTest is AuctionRevenueFixture {
 
     function testRejectZeroAndOverMaxAndRollbackOnFailedTransfer() public {
         vm.expectRevert(Auction.InvalidAmount.selector);
-        vm.prank(admin);
-        auction.depositNFTRevenue(0);
+        _depositTo(auction, 0);
         _deposit(10 * U);
         Auction.NFTRevenueWithdrawal memory a = _authorization(11 * U);
         bytes memory signature = _signature(a, SIGNER_KEY, address(auction), block.chainid);
@@ -508,8 +548,7 @@ contract AuctionRevenueTest is AuctionRevenueFixture {
         vm.prank(admin);
         token.approve(address(auction), 0);
         vm.expectRevert();
-        vm.prank(admin);
-        auction.depositNFTRevenue(U);
+        _depositTo(auction, U);
         assertEq(auction.totalRevenueDeposited(), 10 * U);
     }
 
@@ -538,15 +577,16 @@ contract AuctionRevenueTest is AuctionRevenueFixture {
         malicious.mint(admin, 10 * U);
         vm.prank(admin);
         malicious.approve(address(target), type(uint256).max);
-        malicious.configure(address(target), false);
+        bytes32 signerRole = target.REVENUE_AUTHORIZER_ROLE();
         vm.prank(admin);
-        target.depositNFTRevenue(U);
+        target.grantRole(signerRole, signer);
+        malicious.configure(address(target), false);
+        _depositTo(target, U);
         assertFalse(malicious.callbackSucceeded());
         assertEq(target.totalRevenueDeposited(), U);
         malicious.configure(address(0), true);
         vm.expectRevert(Auction.InvalidRevenueDeposit.selector);
-        vm.prank(admin);
-        target.depositNFTRevenue(U);
+        _depositTo(target, U);
         assertEq(target.totalRevenueDeposited(), U);
         assertEq(malicious.balanceOf(address(target)), U);
     }
@@ -577,7 +617,7 @@ contract AuctionRevenueTest is AuctionRevenueFixture {
         NFTRevenueModule module = new NFTRevenueModule(auction.SIGNATURE_VERIFIER());
         vm.expectRevert(NFTRevenueModule.InvalidRevenueAuthorization.selector);
         vm.prank(admin);
-        module.depositNFTRevenue(U);
+        module.depositNFTRevenue(NFTRevenueModule.NFTRevenueDeposit(admin, U, bytes32(0), block.timestamp + 1), "");
         vm.expectRevert(NFTRevenueModule.InvalidRevenueAuthorization.selector);
         vm.prank(admin);
         module.claimNFTRefund(bytes32(uint256(1)), new uint256[](1));

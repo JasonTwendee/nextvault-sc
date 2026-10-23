@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.13;
 
-import {AuctionRevenueFixture} from "./AuctionRevenue.t.sol";
+import {AuctionRevenueFixture, signedRevenueDeposit} from "./AuctionRevenue.t.sol";
 import {Auction} from "../src/Auction.sol";
 import {FakeUSDC} from "../src/FakeUSDC.sol";
 import {LotNFT} from "../src/LotNFT.sol";
@@ -172,7 +172,10 @@ contract AuctionRevenueAdversarialTest is AuctionRevenueFixture {
         bytes memory signature = _signature(a, SIGNER_KEY, address(auction), block.chainid);
         bytes[] memory attacks = new bytes[](6);
         attacks[0] = abi.encodeCall(auction.buyNFT, (lot, 1));
-        attacks[1] = abi.encodeCall(auction.depositNFTRevenue, (U));
+        attacks[1] = abi.encodeCall(
+            auction.depositNFTRevenue,
+            (Auction.NFTRevenueDeposit(address(receiver), U, bytes32(0), block.timestamp + 1), bytes(""))
+        );
         attacks[2] = abi.encodeCall(auction.withdrawNFTRevenue, (a, signature));
         attacks[3] = abi.encodeCall(auction.claimNFTRefund, (lot, _ids(1, 1)));
         attacks[4] = abi.encodeCall(auction.endAuction, (lot));
@@ -265,14 +268,12 @@ contract AuctionRevenueAdversarialTest is AuctionRevenueFixture {
         weird.approve(address(target), 10 * U);
         weird.setMode(1);
         vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(weird)));
-        vm.prank(admin);
-        target.depositNFTRevenue(10 * U);
+        _depositTo(target, 10 * U);
         assertEq(weird.balanceOf(admin), 10 * U);
         assertEq(weird.balanceOf(address(target)), 0);
         assertEq(target.totalRevenueDeposited(), 0);
         weird.setMode(2);
-        vm.prank(admin);
-        target.depositNFTRevenue(10 * U);
+        _depositTo(target, 10 * U);
         assertEq(target.getMaxWithdraw(), 10 * U);
         Auction.NFTRevenueWithdrawal memory a = _authorization(10 * U);
         a.treasury = admin;

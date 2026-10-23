@@ -144,6 +144,13 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
         uint256 deadline;
     }
 
+    struct NFTRevenueDeposit {
+        address admin;
+        uint256 amount;
+        bytes32 nonce;
+        uint256 deadline;
+    }
+
     error InvalidToken();
     error InvalidLotId();
     error LotAlreadyRegistered();
@@ -1045,13 +1052,7 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
         return required > available ? required - available : 0;
     }
 
-    function depositNFTRevenue(
-        uint256 /* amount */
-    )
-        external
-        onlyRole(DEFAULT_ADMIN_ROLE)
-        revenueNonReentrant
-    {
+    function depositNFTRevenue(NFTRevenueDeposit calldata, bytes calldata) external revenueNonReentrant {
         _executeRevenueModule();
     }
 
@@ -1063,7 +1064,6 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
         bytes calldata /* signature */
     )
         external
-        onlyRole(DEFAULT_ADMIN_ROLE)
         revenueNonReentrant
     {
         _executeRevenueModule();
