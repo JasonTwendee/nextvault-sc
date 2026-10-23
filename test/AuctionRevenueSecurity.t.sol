@@ -297,6 +297,7 @@ contract RevenueInvariantHandler is Test {
     uint256 private nonce;
     bool[3] public withdrawn;
     bool[3] public claimed;
+    uint256[3] public claimedCount;
 
     constructor(Auction a, FakeUSDC t, address ad, address op, address b) {
         auction = a;
@@ -376,14 +377,25 @@ contract RevenueInvariantHandler is Test {
     function claim(uint8 raw) external {
         uint256 index = raw % 3;
         if (!withdrawn[index] || claimed[index]) return;
-        uint256 count = (index + 1) * 10;
+        _claim(index, (index + 1) * 10 - claimedCount[index]);
+    }
+
+    function claimPartial(uint8 raw, uint8 rawCount) external {
+        uint256 index = raw % 3;
+        if (!withdrawn[index] || claimed[index]) return;
+        uint256 remaining = (index + 1) * 10 - claimedCount[index];
+        _claim(index, bound(uint256(rawCount), 1, remaining));
+    }
+
+    function _claim(uint256 index, uint256 count) private {
         uint256[] memory ids = new uint256[](count);
         for (uint256 i; i < count; ++i) {
-            ids[i] = i + 1;
+            ids[i] = claimedCount[index] + i + 1;
         }
         vm.prank(buyer);
         auction.claimNFTRefund(bytes32(index + 1), ids);
-        claimed[index] = true;
+        claimedCount[index] += count;
+        claimed[index] = claimedCount[index] == (index + 1) * 10;
         reserve -= count * 1e6;
     }
 }
@@ -406,12 +418,13 @@ contract AuctionRevenueInvariantTest is AuctionRevenueFixture {
         _end(bytes32(uint256(3)));
         handler = new RevenueInvariantHandler(auction, token, admin, operator, buyer);
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](5);
+        bytes4[] memory selectors = new bytes4[](6);
         selectors[0] = handler.deposit.selector;
         selectors[1] = handler.donate.selector;
         selectors[2] = handler.withdrawRevenue.selector;
         selectors[3] = handler.withdrawLot.selector;
         selectors[4] = handler.claim.selector;
+        selectors[5] = handler.claimPartial.selector;
         targetSelector(FuzzSelector(address(handler), selectors));
     }
 
@@ -424,5 +437,19 @@ contract AuctionRevenueInvariantTest is AuctionRevenueFixture {
         // 10 USDC active pass reserve + 100 USDC bidder collateral are never eligible.
         assertEq(token.balanceOf(address(auction)), max + handler.reserve() + 110 * U + handler.donations());
         assertEq(auction.totalPassRevenue(), 70 * U);
+    }
+
+    function invariantEveryUnclaimedRefundRemainsReserved() public view {
+        uint256 liability;
+        for (uint256 i; i < 3; ++i) {
+            bytes32 lot = bytes32(i + 1);
+            uint256 originalQuantity = (i + 1) * 10;
+            assertEq(auction.lotPassRevenue(lot), originalQuantity * U);
+            uint256 held = LotNFT(auction.getAuction(lot).nftCollection).balanceOf(buyer);
+            assertEq(held, originalQuantity - handler.claimedCount(i));
+            if (handler.withdrawn(i)) liability += held * U;
+        }
+        assertEq(handler.reserve(), liability);
+        assertGe(token.balanceOf(address(auction)), liability + 110 * U);
     }
 }
