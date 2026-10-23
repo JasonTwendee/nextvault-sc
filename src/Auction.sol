@@ -7,6 +7,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {AuctionSignatureVerifier} from "./AuctionSignatureVerifier.sol";
+import {NFTRevenueStorage} from "./NFTRevenueStorage.sol";
+import {NFTRevenueModule} from "./NFTRevenueModule.sol";
 import {LotNFT} from "./LotNFT.sol";
 import {INFTDesignManager} from "./interfaces/INFTDesignManager.sol";
 
@@ -14,6 +16,8 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    // Grant explicitly to the backend's 2FA authorization signer, not to UI admins.
+    bytes32 public constant REVENUE_AUTHORIZER_ROLE = keccak256("REVENUE_AUTHORIZER_ROLE");
     uint256 internal constant BPS_DENOMINATOR = 10_000;
     uint16 internal constant DEFAULT_BUYER_PREMIUM_BPS = 1_000;
     uint16 internal constant DEFAULT_SELLER_COMMISSION_BPS = 1_000;
@@ -132,6 +136,14 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
         uint256 deadline;
     }
 
+    struct NFTRevenueWithdrawal {
+        address admin;
+        uint256 amount;
+        address treasury;
+        bytes32 nonce;
+        uint256 deadline;
+    }
+
     error InvalidToken();
     error InvalidLotId();
     error LotAlreadyRegistered();
@@ -175,6 +187,16 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
     error DepositCannotBeReduced();
     error ConsignorCannotParticipate();
     error WinnerNftNotRefundable();
+    error InsufficientNFTRefundFunds(uint256 required, uint256 available);
+    error InsufficientNFTRevenue(uint256 requested, uint256 available);
+    error InvalidRevenueAuthorization();
+    error RevenueReentrancy();
+    error InvalidRevenueDeposit();
+
+    event NFTRevenueDeposited(address indexed admin, uint256 amount, uint256 blockTimestamp);
+    event NFTRevenueWithdrawn(
+        address indexed admin, address indexed treasury, uint256 amount, bytes32 indexed nonce, uint256 blockTimestamp
+    );
 
     event AuctionCreated(bytes32 indexed lotId, address indexed nftCollection, uint256 blockTimestamp);
     event AuctionDetailsUpdated(
@@ -309,11 +331,24 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
     // Append-only upgrade storage. A zero debt preserves the legacy full-deposit behaviour.
     mapping(address => DepositDebtLedger) private bidderDepositDebt;
 
+    // New-lot accounting only. Legacy auction revenue must not be inferred from
+    // the shared token balance, which also contains bidder collateral.
+    bool private revenueEntered;
+
+    modifier revenueNonReentrant() {
+        if (revenueEntered) revert RevenueReentrancy();
+        revenueEntered = true;
+        _;
+        revenueEntered = false;
+    }
+
     AuctionSignatureVerifier public immutable SIGNATURE_VERIFIER;
+    NFTRevenueModule private immutable REVENUE_MODULE;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         SIGNATURE_VERIFIER = new AuctionSignatureVerifier();
+        REVENUE_MODULE = new NFTRevenueModule(SIGNATURE_VERIFIER);
         _disableInitializers();
     }
 
@@ -569,7 +604,7 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
         emit AuctionDetailsUpdated(lotId, consignor, lowEstimate, highEstimate, thumbnailUrl, block.timestamp);
     }
 
-    function buyNFT(bytes32 lotId, uint256 quantity) external {
+    function buyNFT(bytes32 lotId, uint256 quantity) external revenueNonReentrant {
         _checkWalletCanAct(msg.sender);
         if (!auctionExists[lotId]) revert AuctionNotFound();
         AuctionConfig storage auction = auctions[lotId];
@@ -585,6 +620,8 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
 
         uint256 totalPrice = auction.nftPrice * quantity;
         token.safeTransferFrom(msg.sender, address(this), totalPrice);
+        NFTRevenueStorage.layout().lotRevenue[lotId] += totalPrice;
+        NFTRevenueStorage.layout().totalPassRevenue += totalPrice;
 
         uint256 lastTokenId = LotNFT(auction.nftCollection).mintBatch(msg.sender, quantity);
         uint256 firstTokenId = lastTokenId - quantity + 1;
@@ -809,6 +846,7 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
     function endAuction(bytes32 lotId)
         external
         onlyRole(OPERATOR_ROLE)
+        revenueNonReentrant
         returns (address winner, uint256 winningBid, bool paymentCollected)
     {
         if (!auctionExists[lotId]) revert AuctionNotFound();
@@ -821,6 +859,7 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
         winningBid = itemToCurrentBid[lotId];
         paymentCollected = _trySettleAuctionPayment(lotId, winner, winningBid);
         auctionPaymentCollected[lotId] = paymentCollected;
+        if (winner == address(0) || paymentCollected) _includePassRevenue(lotId);
         AuctionConfig storage auction = auctions[lotId];
         auctionPaymentDeadline[lotId] =
             winner != address(0) && !paymentCollected ? auction.endTime + auction.paymentGracePeriodSeconds : 0;
@@ -879,7 +918,7 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
         return true;
     }
 
-    function settleAuctionPayment(bytes32 lotId) external returns (bool paymentCollected) {
+    function settleAuctionPayment(bytes32 lotId) external revenueNonReentrant returns (bool paymentCollected) {
         if (!auctionExists[lotId]) revert AuctionNotFound();
         if (cancelledAuctions[lotId]) revert AuctionIsCancelled();
         if (!endedAuctions[lotId]) revert AuctionNotEnded();
@@ -893,7 +932,10 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
         paymentCollected = _trySettleAuctionPayment(lotId, winner, winningBid);
         auctionPaymentCollected[lotId] = paymentCollected;
 
-        if (paymentCollected) auctionPaymentDeadline[lotId] = 0;
+        if (paymentCollected) {
+            auctionPaymentDeadline[lotId] = 0;
+            _includePassRevenue(lotId);
+        }
 
         emit WinnerPaymentCollected(lotId, winner, winningBid, paymentCollected, block.timestamp);
 
@@ -943,9 +985,18 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
         );
     }
 
-    function withdrawAuction(bytes32 lotId) external onlyRole(OPERATOR_ROLE) {
+    function withdrawAuction(bytes32 lotId) external onlyRole(OPERATOR_ROLE) revenueNonReentrant {
         if (!auctionExists[lotId]) revert AuctionNotFound();
         if (cancelledAuctions[lotId]) revert AuctionAlreadyCancelled();
+
+        NFTRevenueStorage.Layout storage revenue = NFTRevenueStorage.layout();
+        if (revenue.eligibleLots[lotId]) {
+            uint256 available = getMaxWithdraw();
+            uint256 required = revenue.lotRevenue[lotId];
+            if (required > available) revert InsufficientNFTRefundFunds(required, available);
+            revenue.eligibleLots[lotId] = false;
+            revenue.eligiblePassRevenue -= required;
+        }
 
         cancelledAuctions[lotId] = true;
         auctionPaymentDeadline[lotId] = 0;
@@ -962,26 +1013,90 @@ contract Auction is AccessControlUpgradeable, UUPSUpgradeable {
         itemToAutoBid[lotId] = false;
     }
 
-    function claimNFTRefund(bytes32 lotId, uint256[] calldata tokenIds) external {
+    function claimNFTRefund(bytes32 lotId, uint256[] calldata tokenIds) external revenueNonReentrant {
         if (!auctionExists[lotId]) revert AuctionNotFound();
         if (!cancelledAuctions[lotId]) revert AuctionNotWithdrawn();
 
         uint256 quantity = tokenIds.length;
         if (quantity == 0) revert InvalidQuantity();
 
-        AuctionConfig storage auction = auctions[lotId];
-        LotNFT nftCollection = LotNFT(auction.nftCollection);
-        // Passes occupy IDs 1..maxSupply. The complimentary winner NFT is
-        // maxSupply + 1 and stays with its holder, including after transfer.
-        for (uint256 i; i < quantity; ++i) {
-            if (tokenIds[i] > auction.nftMaxSupply) revert WinnerNftNotRefundable();
+        _executeRevenueModule();
+    }
+
+    function _includePassRevenue(bytes32 lotId) internal {
+        NFTRevenueStorage.Layout storage s = NFTRevenueStorage.layout();
+        if (!s.eligibleLots[lotId]) {
+            s.eligibleLots[lotId] = true;
+            s.eligiblePassRevenue += s.lotRevenue[lotId];
         }
-        nftCollection.burnBatchForRefund(msg.sender, tokenIds);
+    }
 
-        uint256 refundAmount = auction.nftPrice * quantity;
-        token.safeTransfer(msg.sender, refundAmount);
+    /// @notice Accounting entitlement, never the shared USDC balance.
+    function getMaxWithdraw() public view returns (uint256) {
+        NFTRevenueStorage.Layout storage s = NFTRevenueStorage.layout();
+        return s.eligiblePassRevenue + s.totalDeposited - s.totalWithdrawn;
+    }
 
-        emit NFTRefundClaimed(lotId, msg.sender, tokenIds, refundAmount, block.timestamp);
+    function getNFTRefundShortfall(bytes32 lotId) public view returns (uint256) {
+        if (!auctionExists[lotId]) revert AuctionNotFound();
+        if (!NFTRevenueStorage.layout().eligibleLots[lotId]) return 0;
+        uint256 required = NFTRevenueStorage.layout().lotRevenue[lotId];
+        uint256 available = getMaxWithdraw();
+        return required > available ? required - available : 0;
+    }
+
+    function depositNFTRevenue(
+        uint256 /* amount */
+    )
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        revenueNonReentrant
+    {
+        _executeRevenueModule();
+    }
+
+    /// @dev The backend signs only after verifying 2FA. There is no unsigned
+    /// admin/operator withdrawal path. Domain is chain + Auction proxy address.
+    function withdrawNFTRevenue(
+        NFTRevenueWithdrawal calldata,
+        /* authorization */
+        bytes calldata /* signature */
+    )
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        revenueNonReentrant
+    {
+        _executeRevenueModule();
+    }
+
+    function lotPassRevenue(bytes32 lotId) public view returns (uint256) {
+        return NFTRevenueStorage.layout().lotRevenue[lotId];
+    }
+
+    function totalPassRevenue() external view returns (uint256) {
+        return NFTRevenueStorage.layout().totalPassRevenue;
+    }
+
+    function eligiblePassRevenue() external view returns (uint256) {
+        return NFTRevenueStorage.layout().eligiblePassRevenue;
+    }
+
+    function totalRevenueDeposited() external view returns (uint256) {
+        return NFTRevenueStorage.layout().totalDeposited;
+    }
+
+    function totalRevenueWithdrawn() external view returns (uint256) {
+        return NFTRevenueStorage.layout().totalWithdrawn;
+    }
+
+    function consumeRevenueNonce(bytes32 nonce) external {
+        if (msg.sender != address(this)) revert InvalidRevenueAuthorization();
+        usedNonces[nonce] = true;
+    }
+
+    function _executeRevenueModule() private {
+        (bool success, bytes memory result) = address(REVENUE_MODULE).delegatecall(msg.data);
+        if (!success) assembly ("memory-safe") { revert(add(result, 32), mload(result)) }
     }
 
     function getNFTRefundAmount(bytes32 lotId, address holder)
