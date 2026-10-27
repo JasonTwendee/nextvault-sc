@@ -486,6 +486,40 @@ contract AuctionBidAuthorizationTest is Test {
         assertTrue(auction.blacklistedWallets(bidderA));
     }
 
+    function testFinalizedWithdrawalKeepsSettlementAndUnusedMaxAllowanceWithPartialCredit() external {
+        // Same proportions as max 500 / hammer 100 / limit 100 / collateral 40.
+        uint256 maxBid = STARTING_BID * 5;
+        uint256 approved = maxBid * 11 / 10;
+        uint256 actualDeposit = STARTING_BID * 4 / 10;
+        uint256 debt = maxBid / 10 - actualDeposit;
+        vm.prank(bidderA);
+        token.approve(address(auction), approved);
+        _setAuthorizedMax(LOT_ID, bidderA, maxBid, debt, STARTING_BID, "finalized-revoke-max");
+        assertEq(token.allowance(bidderA, address(auction)), approved - actualDeposit);
+        vm.prank(operator);
+        auction.placeBidFor(LOT_ID, bidderA, STARTING_BID);
+        vm.warp(auction.getAuction(LOT_ID).endTime);
+        vm.prank(operator);
+        (,, bool collected) = auction.endAuction(LOT_ID);
+        assertTrue(collected);
+        uint256 totalPaid = STARTING_BID * 11 / 10;
+        uint256 unused = approved - actualDeposit - (totalPaid - actualDeposit);
+        assertEq(unused, STARTING_BID * 44 / 10);
+        assertEq(token.allowance(bidderA, address(auction)), unused);
+        uint256 winnerBalance = token.balanceOf(bidderA);
+        uint256 consignorBalance = token.balanceOf(consignor);
+        uint256 treasuryBalance = token.balanceOf(admin);
+        vm.prank(operator);
+        auction.withdrawAuction(LOT_ID);
+        assertEq(token.balanceOf(bidderA), winnerBalance);
+        assertEq(token.balanceOf(consignor), consignorBalance);
+        assertEq(token.balanceOf(admin), treasuryBalance);
+        assertEq(token.allowance(bidderA, address(auction)), unused);
+        vm.prank(bidderA);
+        token.approve(address(auction), 0);
+        assertEq(token.allowance(bidderA, address(auction)), 0);
+    }
+
     function testNonWinnerMaxRefundDoesNotReleaseDebtFromAnotherAuction() external {
         _createActiveAuctionFor(LOT_ID_2, "refund-second-auction");
         _buyNftFor(LOT_ID_2, bidderA);
