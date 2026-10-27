@@ -1313,6 +1313,47 @@ contract AuctionEndWithdrawTest is Test {
         assertFalse(auction.blacklistedWallets(bidderA));
     }
 
+    function testWithdrawGraceMax400Actual100Refunds40AndLeaves400UnusedAllowance() external {
+        Auction.AuctionConfig memory config = _createAuctionWithStartingBid(0, 100 * USDC);
+        _buyNft(bidderA);
+        // Shared ERC20 allowance also reserves 330 for unrelated auctions.
+        vm.startPrank(bidderA);
+        token.approve(address(auction), 770 * USDC);
+        auction.setMaxBid(LOT_ID, 400 * USDC);
+        assertEq(token.allowance(bidderA, address(auction)), 730 * USDC);
+        token.transfer(stranger, token.balanceOf(bidderA));
+        vm.stopPrank();
+        vm.prank(operator);
+        auction.placeBidFor(LOT_ID, bidderA, 100 * USDC);
+        vm.warp(config.endTime);
+        vm.prank(operator);
+        (,, bool paid) = auction.endAuction(LOT_ID);
+        assertFalse(paid);
+        vm.prank(operator);
+        auction.withdrawAuction(LOT_ID);
+        // Max-bid escrow is refunded through the backend operator flow.
+        vm.expectEmit(true, true, false, true, address(auction));
+        emit MaxBidRefunded(LOT_ID, bidderA, 40 * USDC, block.timestamp);
+        vm.prank(operator);
+        auction.refundMaxBid(LOT_ID, bidderA);
+        assertEq(token.balanceOf(bidderA), 40 * USDC);
+        assertEq(token.allowance(bidderA, address(auction)), 730 * USDC);
+        assertEq(token.balanceOf(address(auction)), config.nftPrice);
+        vm.prank(operator);
+        vm.expectRevert(Auction.InvalidAmount.selector);
+        auction.refundMaxBid(LOT_ID, bidderA);
+        // Returning collateral does not restore allowance consumed by transferFrom.
+        vm.prank(bidderA);
+        token.approve(address(auction), 730 * USDC - 400 * USDC);
+        assertEq(token.allowance(bidderA, address(auction)), 330 * USDC);
+        vm.warp(config.endTime + config.paymentGracePeriodSeconds + 1);
+        vm.expectRevert(Auction.AuctionIsCancelled.selector);
+        auction.settleAuctionPayment(LOT_ID);
+        assertFalse(auction.blacklistedWallets(bidderA));
+        assertEq(auction.auctionPaymentDeadline(LOT_ID), 0);
+        assertEq(token.balanceOf(bidderA), 40 * USDC);
+    }
+
     function testWithdrawBoughtInRefundsPasses() external {
         Auction.AuctionConfig memory config = _createAuction(0);
         _buyNft(bidderA);
